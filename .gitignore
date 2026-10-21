@@ -20,6 +20,8 @@ API_KEY.txt
 # Build artifacts
 *.tmp
 __pycache__/
+# 本地编译产物（dist/ 由 docs/build_local.ps1 生成，含 exe/zip，不入库）
+/dist/
 
 # Backups (contains auth tokens)
 backups/
@@ -45,4 +47,5 @@ docs/
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/
 *.zip
+/参考
 server.exe
