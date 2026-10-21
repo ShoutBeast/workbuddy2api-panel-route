@@ -47,13 +47,23 @@ func TestRoutePanelWiring(t *testing.T) {
 		{"锁表解锁时刻", `unlock_at`},
 		{"倍率复用模型页", `rateCell(m)`},
 		{"上下文列", `context_length`},
-		{"三列渲染", `function rtMetaHtml`},
+		// 目标列表改成表格：列宽由 colgroup 固定（列自然对齐），整行可拖拽
+		{"目标表格", `function rtTargetTable`},
+		{"列宽固定", `table-layout:fixed`},
+		{"列定义", `<colgroup>`},
+		{"状态单元格", `function rtStatusSpan`},
+		{"倍率单元格", `function rtRateCell`},
+		{"上下文单元格", `function rtCtxCell`},
 		// 下拉必须是 fixed 全局弹层：卡片容器带 overflow，内联 absolute 会被裁掉
 		{"弹层挂 body", `id = 'rtPickBox'`},
 		{"弹层 fixed 定位", `position:fixed;z-index:200`},
 		// 回归：滚动/失焦都不得收起弹层（弹层自身可滚动，收起会把自己滚没）
 		{"滚动只跟随", `function rtPickOnScroll`},
 		{"跟随重定位", `function rtPickPlace`},
+		// 状态列必须能原地刷新：锁态变化后不能还显示「正常」
+		{"状态可 patch", `data-rt-status`},
+		{"状态定时刷新", `function rtRefreshStatuses`},
+		{"模型页轮询接入", `else if (view === 'models')`},
 	}
 	for _, c := range checks {
 		if !strings.Contains(j, c.needle) {
@@ -71,5 +81,23 @@ func TestRoutePanelWiring(t *testing.T) {
 		if strings.Contains(j, bad) {
 			t.Fatalf("弹层不应因滚动/失焦而收起，但发现 %q", bad)
 		}
+	}
+
+	// 路由状态刷新只能写自己的 rtLocks：mdLocks 是模型页（含 global 可用性标签）的数据源，
+	// 账号级状态/模型页标签不该被路由的定时刷新改写。
+	i := strings.Index(j, "async function rtRefreshStatuses")
+	if i < 0 {
+		t.Fatal("缺少 rtRefreshStatuses")
+	}
+	end := i + 1400
+	if end > len(j) {
+		end = len(j)
+	}
+	body := j[i:end]
+	if strings.Contains(body, "mdLocks =") {
+		t.Fatal("路由状态刷新改写了模型页的 mdLocks：账号/模型页状态归它们自己维护")
+	}
+	if !strings.Contains(body, "rtLocks =") {
+		t.Fatal("路由状态刷新应写入自己的 rtLocks 快照")
 	}
 }

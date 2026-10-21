@@ -408,6 +408,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .view { padding: 14px 12px 60px; }
   /* 表格：整表横向滑动（保持桌面列布局，不被压扁） */
   table.acc { display: block; overflow-x: auto; white-space: nowrap; }
+  /* route: begin —— 修「两条横向滚动条」：.tbl-wrap 已经在滚，表格自身再滚就变成嵌套双条 */
+  .tbl-wrap table.acc { overflow-x: visible; }
+  /* route: end */
   /* 分类条 / 选项 chips：横向滑动 */
   .chips { display: flex; min-width: 0; overflow-x: auto; padding-bottom: 2px; }
   .chips .chip { flex: none; }

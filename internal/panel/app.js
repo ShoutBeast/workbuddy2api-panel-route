@@ -723,6 +723,7 @@ async function loadModels(force) {
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+    rtLocks = null; // 让路由卡回落到本次最新快照（而不是上一轮定时刷新留下的）
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
@@ -943,6 +944,11 @@ $('btnModels').onclick = () => loadModels(true);
  */
 let rtState = null;   // {enabled, maxAttempts, items:[{name, enabled, targets:[{realm, model}], on:[]}]}
 let rtDrag = null;    // 正在拖拽的目标 {ri, ti}
+// rtLocks 路由卡专用的锁表快照（null = 还没单独拉过，回落到模型页的 mdLocks）。
+// 刻意**不复用/不改写 mdLocks**：那份是模型页（含 global 可用性标签）的数据源，
+// 路由的定时刷新不该把别人的状态改掉。
+let rtLocks = null;
+function rtLockRows() { return Array.isArray(rtLocks) ? rtLocks : mdLocks; }
 
 function rtNorm(cfg) {
   const r = (cfg && cfg.routes) || {};
@@ -1075,6 +1081,32 @@ function rtPickOnScroll() {
   });
 }
 
+// rtRefreshStatuses 用最新 status 快照原地刷新「实时状态」列。
+//
+// 为什么必须定时刷：模型页的 mdLocks 只是进入页面时的快照，而账号池页在轮询。
+// 实测踩到过：CN 池已「全池锁定 0/2」，路由卡片第一跳却仍显示「正常」——
+// 状态列说谎比没有状态列更糟。这里只 patch 文本，不重建卡片。
+let rtStatusInflight = false;
+async function rtRefreshStatuses() {
+  if (!rtState || rtStatusInflight) return;
+  rtStatusInflight = true;
+  try {
+    const st = await api('status');
+    // 只写路由自己的快照：mdLocks 归模型页所有，账号级状态与模型页标签都不受影响
+    rtLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+    Array.prototype.forEach.call(document.querySelectorAll('#rtList [data-rt-status]'), function (el) {
+      const s = rtStatusOf(el.getAttribute('data-rt-status'));
+      el.className = 'tag ' + s.cls;
+      el.textContent = s.label;
+      el.setAttribute('title', s.tip);
+    });
+  } catch (e) {
+    // 静默：状态刷新失败不该影响正在编辑的配置
+  } finally {
+    rtStatusInflight = false;
+  }
+}
+
 function rtAddTarget(ri, id) {
   const it = rtState.items[ri];
   if (!it || !id) return;
@@ -1110,7 +1142,7 @@ function rtStatusOf(id) {
     return d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
   };
 
-  const lock = mdLocks.find(function (r) { return r && r.realm === realm && r.model === bare; });
+  const lock = rtLockRows().find(function (r) { return r && r.realm === realm && r.model === bare; });
   if (lock) {
     const at = lock.unlock_at ? hhmm(lock.unlock_at) : '';
     const reason = String(lock.reason || '');
@@ -1170,42 +1202,57 @@ function rtStatusOf(id) {
   return { label: '待验证', cls: 'mute', tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
 }
 
-// rtMetaHtml 目标行右侧三列：实时状态 / 倍率 / 上下文。
-// 三列宽度固定，模型名也固定宽度并做省略号——否则名字长短不齐会让三列错位，
-// 一屏十行就没法竖着扫了。
-function rtMetaHtml(id) {
-  const m = rtModelOf(id);
+// 三列各自成格：表格布局下由 colgroup 定宽，列自然对齐（不再靠 min-width 硬拼）。
+// data-rt-status 供定时刷新原地 patch：只改这一格，不重建卡片（避免打断搜索框输入）。
+function rtStatusSpan(id) {
   const st = rtStatusOf(id);
-  const status = '<span class="tag ' + st.cls + '" title="' + esc(st.tip) + '">' + esc(st.label) + '</span>';
-  const raw = m ? rateCell(m) : '<span style="color:var(--ink-3)">—</span>';
-  // 纯数字才加 × 前缀；带折扣标签/划线的复合值不加，否则会读成「×0.4 夜间五折 0.8」
-  const plain = /^[\d.]+$/.test(raw);
-  const rate = (plain ? '×' : '') + raw;
-  const ctx = m && m.context_length
-    ? Math.round(m.context_length / 1000) + 'K'
-    : '<span style="color:var(--ink-3)">—</span>';
-  return '<span style="min-width:104px;display:inline-block">' + status + '</span>' +
-    '<span class="note" style="min-width:104px;display:inline-block" title="积分倍率（与模型与档位同口径）">' + rate + '</span>' +
-    '<span class="note" style="min-width:72px;display:inline-block" title="上下文长度">ctx ' + ctx + '</span>';
+  return '<span class="tag ' + st.cls + '" data-rt-status="' + esc(id) + '" title="' + esc(st.tip) + '">' +
+    esc(st.label) + '</span>';
 }
 
-function rtCardHtml(it, ri) {
+// 纯数字才加 × 前缀；带折扣标签/划线的复合值不加，否则会读成「×0.4 夜间五折 0.8」
+function rtRateCell(id) {
+  const m = rtModelOf(id);
+  const raw = m ? rateCell(m) : '<span style="color:var(--ink-3)">—</span>';
+  return (/^[\d.]+$/.test(raw) ? '×' : '') + raw;
+}
+
+function rtCtxCell(id) {
+  const m = rtModelOf(id);
+  return m && m.context_length
+    ? Math.round(m.context_length / 1000) + 'K'
+    : '<span style="color:var(--ink-3)">—</span>';
+}
+
+// rtTargetTable 目标列表：与「模型与档位」同款 table.acc，列宽由 colgroup 固定
+// （列天然对齐），整行可拖拽排序——不再放额外的拖动手柄，避免一行出现两个「可拖动」提示。
+function rtTargetTable(it, ri) {
   const rows = it.targets.map(function (t, ti) {
-    return '<li class="rt-it" draggable="true" data-ri="' + ri + '" data-ti="' + ti + '"' +
-      ' style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:grab">' +
-      '<span aria-hidden="true" style="opacity:.5">⠿</span>' +
-      '<span class="note">' + (ti + 1) + '</span>' +
-      '<span class="rt-mid" style="min-width:300px;max-width:300px;display:inline-block;overflow:hidden;' +
-      'text-overflow:ellipsis;white-space:nowrap" title="' + esc(t.realm) + ':' + esc(t.model) + '">' +
-      '<code>' + esc(t.realm) + ':' + esc(t.model) + '</code></span>' +
-      rtMetaHtml(t.realm + ':' + t.model) +
-      '<span class="grow"></span>' +
+    const id = t.realm + ':' + t.model;
+    return '<tr class="rt-it" draggable="true" data-ri="' + ri + '" data-ti="' + ti + '"' +
+      ' style="cursor:grab" title="按住拖动可调整优先级">' +
+      '<td class="note" style="padding:6px 4px;text-align:center">' + (ti + 1) + '</td>' +
+      '<td style="padding:6px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"' +
+      ' title="' + esc(id) + '"><code>' + esc(id) + '</code></td>' +
+      '<td style="padding:6px 8px">' + rtStatusSpan(id) + '</td>' +
+      '<td class="note" style="padding:6px 8px" title="积分倍率（与模型与档位同口径）">' + rtRateCell(id) + '</td>' +
+      '<td class="note" style="padding:6px 8px" title="上下文长度">' + rtCtxCell(id) + '</td>' +
+      '<td style="padding:6px 8px;text-align:right;white-space:nowrap">' +
       '<button class="xs ghost" data-act="up" data-ri="' + ri + '" data-ti="' + ti + '" title="上移">↑</button>' +
       '<button class="xs ghost" data-act="down" data-ri="' + ri + '" data-ti="' + ti + '" title="下移">↓</button>' +
       '<button class="xs ghost" data-act="del" data-ri="' + ri + '" data-ti="' + ti + '" title="移除目标">✕</button>' +
-      '</li>';
-  }).join('') || '<li class="note" style="padding:4px 6px">还没有目标，先从下方下拉框添加</li>';
+      '</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="note" style="padding:10px">还没有目标，从下方搜索框添加</td></tr>';
 
+  return '<div class="tbl-wrap" style="margin:8px 0">' +
+    '<table class="acc rt-tbl" style="width:100%;table-layout:fixed">' +
+    '<colgroup><col style="width:44px"><col><col style="width:120px"><col style="width:150px">' +
+    '<col style="width:96px"><col style="width:132px"></colgroup>' +
+    '<thead><tr><th>#</th><th>模型</th><th>状态</th><th>倍率</th><th>上下文</th><th></th></tr></thead>' +
+    '<tbody>' + rows + '</tbody></table></div>';
+}
+
+function rtCardHtml(it, ri) {
   return '<div style="border:1px solid rgba(128,128,128,.35);border-radius:8px;padding:10px;margin-bottom:10px">' +
     '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
     '<input class="rt-name" data-ri="' + ri + '" value="' + esc(it.name) + '"' +
@@ -1215,7 +1262,7 @@ function rtCardHtml(it, ri) {
     '<span class="grow"></span>' +
     '<button class="xs ghost" data-act="delroute" data-ri="' + ri + '">删除聚合</button>' +
     '</div>' +
-    '<ol style="list-style:none;padding:0;margin:8px 0" data-ri="' + ri + '">' + rows + '</ol>' +
+    rtTargetTable(it, ri) +
     '<div style="display:flex;gap:8px;align-items:center">' +
     '<div class="rt-pick" data-ri="' + ri + '" style="flex:1;min-width:240px;max-width:460px">' +
     '<input class="rt-pick-q" data-ri="' + ri + '" placeholder="搜索模型名后点击添加（支持模糊匹配）" autocomplete="off"' +
@@ -2010,6 +2057,10 @@ $('btnRefresh').onclick = async () => {
 function refreshVisible() {
   if (view === 'accounts') {
     loadOverview(true);
+  }
+  else if (view === 'models') {
+    // 只刷「实时状态」列：mdLocks 是进页面时的快照，锁态变了要跟上。
+    rtRefreshStatuses();
   }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') {
