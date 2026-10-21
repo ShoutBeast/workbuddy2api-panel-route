@@ -706,6 +706,7 @@ function imageRateCell(m) {
 }
 
 async function loadModels(force) {
+  loadRoutes(); // 路由聚合与模型目录相互独立：任一失败都不影响另一个
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
@@ -738,6 +739,9 @@ async function loadModels(force) {
     const srcNote = { 'v3-desktop': '', 'v3-union': ' · ⚠ 国际版目录来自回落（IDE+CLI 并集）', 'enterprise': ' · ⚠ 国际版目录已降级到企业端点（窄目录/旧倍率）' }[d.global_source] || '';
     $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '') + srcNote;
     renderModels();
+    // 路由目标行的「状态/倍率/ctx」都来自本次拉到的目录与锁表：一并刷新，
+    // 否则模型页刷新后路由区还停在上一轮的快照上。
+    if (rtState) renderRoutes();
   } catch (e) {
     mdAll = [];
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
@@ -931,6 +935,448 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
 }
 $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = () => loadModels(true);
+
+/* ── 模型路由聚合（route: begin —— 我方扩展）─────────────────────────
+ * 编辑的是 config.json 的 routes 段：对外一个聚合名，内部按顺序尝试多个
+ * (realm, 模型)。保存走既有 POST /panel/api/config（校验→落盘→热生效同一条路），
+ * 因此后端不需要新增接口；校验错误由 Go 侧 errors.Join 逐条回显。
+ */
+let rtState = null;   // {enabled, maxAttempts, items:[{name, enabled, targets:[{realm, model}], on:[]}]}
+let rtDrag = null;    // 正在拖拽的目标 {ri, ti}
+
+function rtNorm(cfg) {
+  const r = (cfg && cfg.routes) || {};
+  const items = Array.isArray(r.items) ? r.items : [];
+  return {
+    enabled: r.enabled !== false,
+    maxAttempts: Number(r.max_attempts) || 0,
+    items: items.map(function (it) {
+      return {
+        name: String(it.name || ''),
+        enabled: it.enabled !== false,
+        on: Array.isArray(it.on) ? it.on.slice() : [],
+        targets: (Array.isArray(it.targets) ? it.targets : []).map(function (t) {
+          return { realm: String(t.realm || 'cn'), model: String(t.model || '') };
+        }),
+      };
+    }),
+  };
+}
+
+async function loadRoutes() {
+  try {
+    const d = await api('config');
+    rtState = rtNorm(d.config || {});
+    renderRoutes();
+  } catch (e) {
+    $('rtNote').textContent = '读取路由配置失败：' + e.message;
+  }
+}
+
+// 目标候选直接取「模型与档位」已有的清单（id 自带 cn:/global: 前缀）。
+// 已添加的目标会从候选里剔除；查询词大小写不敏感，且同时匹配 "cn:xxx" 与裸名
+// （用户往往只记得模型名，不想先输入 realm 前缀）。
+function rtPickCandidates(ri, q) {
+  const it = rtState.items[ri];
+  const have = {};
+  (it ? it.targets : []).forEach(function (t) { have[t.realm + ':' + t.model] = true; });
+  const needle = String(q || '').trim().toLowerCase();
+  return mdAll.map(function (m) { return m.id; }).filter(Boolean)
+    .filter(function (id) { return !have[id]; })
+    .filter(function (id) {
+      if (!needle) return true;
+      const lower = id.toLowerCase();
+      const bare = lower.indexOf(':') >= 0 ? lower.slice(lower.indexOf(':') + 1) : lower;
+      return lower.indexOf(needle) >= 0 || bare.indexOf(needle) >= 0;
+    })
+    .slice(0, 80); // 上限：命中过多时先给前 80 条，继续输入即可收窄
+}
+
+// rtPick 候选下拉的全局弹层（挂 body、fixed 定位）。
+//
+// 两条踩过的坑，别再退回去：
+//   1) 不能放卡片里：卡片/表格容器带 overflow，内联 absolute 会被裁掉一半；
+//   2) **滚动不能收起弹层**：弹层自身就是滚动容器（max-height + overflow:auto），
+//      捕获阶段监听 scroll 再 hide 会让「滚一下候选就没了」。这里只跟随重定位。
+let rtPick = null;   // {ri, anchor, query}
+let rtPickRaf = 0;
+
+function rtPickBox() {
+  let box = document.getElementById('rtPickBox');
+  if (box) return box;
+  box = document.createElement('div');
+  box.id = 'rtPickBox';
+  box.style.cssText = 'position:fixed;z-index:200;max-height:260px;overflow:auto;display:none;' +
+    'background:var(--raise);border:1px solid var(--line);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.18)';
+  document.body.appendChild(box);
+  // mousedown 一律 preventDefault：拖动滚动条/点候选都不抢输入框焦点，
+  // 否则输入框失焦后键盘导航失效。
+  box.addEventListener('mousedown', function (ev) { ev.preventDefault(); });
+  box.addEventListener('click', function (ev) {
+    const item = ev.target.closest('.rt-pick-item');
+    if (item) rtAddTarget(Number(item.dataset.ri), item.dataset.id);
+  });
+  box.addEventListener('mouseover', function (ev) {
+    const row = ev.target.closest('.rt-pick-item');
+    if (row && !row.classList.contains('on')) row.style.background = 'var(--surface-2)';
+  });
+  box.addEventListener('mouseout', function (ev) {
+    const row = ev.target.closest('.rt-pick-item');
+    if (row && !row.classList.contains('on')) row.style.background = '';
+  });
+  return box;
+}
+
+function rtPickHide() {
+  rtPick = null;
+  const box = document.getElementById('rtPickBox');
+  if (box) box.style.display = 'none';
+}
+
+// rtPickPlace 把弹层贴到锚点输入框下方；下方空间不足时翻到上方。
+function rtPickPlace() {
+  const box = document.getElementById('rtPickBox');
+  if (!box || !rtPick) return;
+  const a = rtPick.anchor;
+  if (!a || !a.isConnected) { rtPickHide(); return; }
+  const r = a.getBoundingClientRect();
+  if (r.bottom < 0 || r.top > window.innerHeight) { rtPickHide(); return; }
+  const h = Math.min(box.scrollHeight || 260, 260);
+  const below = window.innerHeight - r.bottom;
+  const top = (below < h + 12 && r.top > below) ? (r.top - h - 2) : (r.bottom + 2);
+  box.style.left = Math.round(r.left) + 'px';
+  box.style.width = Math.round(Math.max(r.width, 260)) + 'px';
+  box.style.top = Math.round(Math.max(8, top)) + 'px';
+}
+
+function rtPickShow(ri, q) {
+  const input = $('rtList').querySelector('.rt-pick-q[data-ri="' + ri + '"]');
+  if (!input) return;
+  const box = rtPickBox();
+  rtPick = { ri: ri, anchor: input, query: String(q || '') };
+  const ids = rtPickCandidates(ri, q);
+  box.innerHTML = ids.length
+    ? ids.map(function (id) {
+        return '<div class="rt-pick-item" data-ri="' + ri + '" data-id="' + esc(id) + '"' +
+          ' style="padding:5px 8px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"' +
+          ' title="' + esc(id) + '">' + esc(id) + '</div>';
+      }).join('')
+    : '<div class="note" style="padding:6px 8px">没有匹配的模型（或已全部添加）</div>';
+  box.style.display = 'block';
+  rtPickPlace();
+}
+
+// 滚动/缩放时只跟随（rAF 合并），绝不收起。
+function rtPickOnScroll() {
+  if (!rtPick || rtPickRaf) return;
+  rtPickRaf = requestAnimationFrame(function () {
+    rtPickRaf = 0;
+    rtPickPlace();
+  });
+}
+
+function rtAddTarget(ri, id) {
+  const it = rtState.items[ri];
+  if (!it || !id) return;
+  const cut = id.indexOf(':');
+  const realm = cut > 0 ? id.slice(0, cut) : 'cn';
+  const model = cut > 0 ? id.slice(cut + 1) : id;
+  if (!it.targets.some(function (t) { return t.realm === realm && t.model === model; })) {
+    it.targets.push({ realm: realm, model: model });
+  }
+  renderRoutes();
+  // 加完保持下拉打开、查询清空：连续添加不用反复点输入框
+  const input = $('rtList').querySelector('.rt-pick-q[data-ri="' + ri + '"]');
+  if (input) { input.focus(); rtPickShow(ri, ''); } else { rtPickHide(); }
+}
+
+// rtModelOf 从「模型与档位」的目录里取该目标的元数据（倍率/ctx 都来自这里）。
+function rtModelOf(id) {
+  return mdAll.find(function (m) { return m && m.id === id; }) || null;
+}
+
+// rtStatusOf 目标当前的实时可用性。口径与模型页的 mdAvailabilityOf 一致，
+// 但**不分域**（聚合目标可能落在 cn 或 global，两者都要能显示）：
+//   1) 先看 status.model_locks（网关自己的锁池画像，带最早/全部解锁时刻）；
+//   2) 没有锁则回落到最近一次真实请求结果；
+//   3) 两者都没有 → 待验证（目录里存在不代表当前账号有权限）。
+function rtStatusOf(id) {
+  const cut = id.indexOf(':');
+  const realm = cut > 0 ? id.slice(0, cut) : 'cn';
+  const bare = cut > 0 ? id.slice(cut + 1) : id;
+  const hhmm = function (t) {
+    const d = new Date(t);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+  };
+
+  const lock = mdLocks.find(function (r) { return r && r.realm === realm && r.model === bare; });
+  if (lock) {
+    const at = lock.unlock_at ? hhmm(lock.unlock_at) : '';
+    const reason = String(lock.reason || '');
+    if (lock.state === 'partial') {
+      return {
+        label: '部分可用', cls: 'warn',
+        tip: '仍有 ' + Number(lock.servable || 0) + '/' + Number(lock.total || 0) + ' 个账号可服务；' +
+          Number(lock.locked || 0) + ' 个被该模型限流' + (at ? '，最早 ' + at + ' 解锁' : '') +
+          (reason ? '；' + reason : ''),
+      };
+    }
+    if (lock.state === 'starved') {
+      return {
+        label: '账号暂不可用', cls: 'mute',
+        tip: '没有账号能服务该模型（账号级冷却/在途占满，与模型无关）' + (at ? '，最早 ' + at + ' 解锁' : ''),
+      };
+    }
+    const lower = reason.toLowerCase();
+    if (lower.indexOf('11158') === 0 || lower.indexOf('not allowed for user type') >= 0) {
+      return { label: '无权限', cls: 'bad', tip: '当前账号类型不支持该模型' + (reason ? '；' + reason : '') };
+    }
+    if (lower.indexOf('11102') === 0 || lower.indexOf('service info not found') >= 0) {
+      return { label: '上游无此模型', cls: 'bad', tip: '上游目录残留，实际请求返回模型不存在' + (reason ? '；' + reason : '') };
+    }
+    return {
+      label: at ? '冷却至 ' + at : '冷却中', cls: 'warn',
+      tip: '该域 ' + Number(lock.locked || 0) + '/' + Number(lock.total || 0) + ' 个账号被限流' +
+        (lock.fully_unlock_at ? '，全部解锁 ' + hhmm(lock.fully_unlock_at) : '') + (reason ? '；' + reason : ''),
+    };
+  }
+
+  // 目录里有数据、却查不到这个模型：多半是名字写错或上游已下线。
+  // 目录整体为空（拉取失败/无账号）时不这么判，否则会把「拿不到目录」误报成「模型不存在」。
+  if (!rtModelOf(id) && mdAll.length) {
+    return {
+      label: '目录中无此模型', cls: 'bad',
+      tip: '当前模型目录里没有 ' + id + '：检查名字拼写，或该模型已从上游下线（保存不会拦，运行时会失败）',
+    };
+  }
+
+  const ev = mdRecent.find(function (e) { return e && e.model === id; });
+  if (ev) {
+    const status = Number(ev.status || 0);
+    const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
+    if (ev.outcome === 'success' || (status >= 200 && status < 300)) {
+      return { label: '正常', cls: 'ok', tip: '最近一次真实请求成功' + (when ? ' · ' + when : '') };
+    }
+    if (status === 429) {
+      return { label: '限流', cls: 'warn', tip: '最近一次请求被限流' + (when ? ' · ' + when : '') };
+    }
+    if (status >= 500) {
+      return { label: '上游错误', cls: 'bad', tip: '最近一次请求上游错误 HTTP ' + status + (when ? ' · ' + when : '') };
+    }
+    return { label: '最近失败', cls: 'bad', tip: '最近一次请求失败 HTTP ' + (status || '—') + (when ? ' · ' + when : '') };
+  }
+
+  return { label: '待验证', cls: 'mute', tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
+}
+
+// rtMetaHtml 目标行右侧三列：实时状态 / 倍率 / 上下文。
+// 三列宽度固定，模型名也固定宽度并做省略号——否则名字长短不齐会让三列错位，
+// 一屏十行就没法竖着扫了。
+function rtMetaHtml(id) {
+  const m = rtModelOf(id);
+  const st = rtStatusOf(id);
+  const status = '<span class="tag ' + st.cls + '" title="' + esc(st.tip) + '">' + esc(st.label) + '</span>';
+  const raw = m ? rateCell(m) : '<span style="color:var(--ink-3)">—</span>';
+  // 纯数字才加 × 前缀；带折扣标签/划线的复合值不加，否则会读成「×0.4 夜间五折 0.8」
+  const plain = /^[\d.]+$/.test(raw);
+  const rate = (plain ? '×' : '') + raw;
+  const ctx = m && m.context_length
+    ? Math.round(m.context_length / 1000) + 'K'
+    : '<span style="color:var(--ink-3)">—</span>';
+  return '<span style="min-width:104px;display:inline-block">' + status + '</span>' +
+    '<span class="note" style="min-width:104px;display:inline-block" title="积分倍率（与模型与档位同口径）">' + rate + '</span>' +
+    '<span class="note" style="min-width:72px;display:inline-block" title="上下文长度">ctx ' + ctx + '</span>';
+}
+
+function rtCardHtml(it, ri) {
+  const rows = it.targets.map(function (t, ti) {
+    return '<li class="rt-it" draggable="true" data-ri="' + ri + '" data-ti="' + ti + '"' +
+      ' style="display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:grab">' +
+      '<span aria-hidden="true" style="opacity:.5">⠿</span>' +
+      '<span class="note">' + (ti + 1) + '</span>' +
+      '<span class="rt-mid" style="min-width:300px;max-width:300px;display:inline-block;overflow:hidden;' +
+      'text-overflow:ellipsis;white-space:nowrap" title="' + esc(t.realm) + ':' + esc(t.model) + '">' +
+      '<code>' + esc(t.realm) + ':' + esc(t.model) + '</code></span>' +
+      rtMetaHtml(t.realm + ':' + t.model) +
+      '<span class="grow"></span>' +
+      '<button class="xs ghost" data-act="up" data-ri="' + ri + '" data-ti="' + ti + '" title="上移">↑</button>' +
+      '<button class="xs ghost" data-act="down" data-ri="' + ri + '" data-ti="' + ti + '" title="下移">↓</button>' +
+      '<button class="xs ghost" data-act="del" data-ri="' + ri + '" data-ti="' + ti + '" title="移除目标">✕</button>' +
+      '</li>';
+  }).join('') || '<li class="note" style="padding:4px 6px">还没有目标，先从下方下拉框添加</li>';
+
+  return '<div style="border:1px solid rgba(128,128,128,.35);border-radius:8px;padding:10px;margin-bottom:10px">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+    '<input class="rt-name" data-ri="' + ri + '" value="' + esc(it.name) + '"' +
+    ' placeholder="对外模型名，如 Deepseek-V4.1F-Aggr" style="min-width:240px">' +
+    '<label class="note" style="display:flex;align-items:center;gap:4px">' +
+    '<input type="checkbox" class="rt-on" data-ri="' + ri + '"' + (it.enabled ? ' checked' : '') + '> 启用</label>' +
+    '<span class="grow"></span>' +
+    '<button class="xs ghost" data-act="delroute" data-ri="' + ri + '">删除聚合</button>' +
+    '</div>' +
+    '<ol style="list-style:none;padding:0;margin:8px 0" data-ri="' + ri + '">' + rows + '</ol>' +
+    '<div style="display:flex;gap:8px;align-items:center">' +
+    '<div class="rt-pick" data-ri="' + ri + '" style="flex:1;min-width:240px;max-width:460px">' +
+    '<input class="rt-pick-q" data-ri="' + ri + '" placeholder="搜索模型名后点击添加（支持模糊匹配）" autocomplete="off"' +
+    ' aria-label="搜索要添加的目标模型" style="width:100%">' +
+    '</div></div></div>';
+}
+
+function renderRoutes() {
+  if (!rtState) return;
+  $('rtEnabled').checked = !!rtState.enabled;
+  $('rtMaxAttempts').value = rtState.maxAttempts || 0;
+  $('rtList').innerHTML = rtState.items.length
+    ? rtState.items.map(rtCardHtml).join('')
+    : '<div class="note">还没有聚合。点右上角「+ 新增聚合」创建一个对外模型名。</div>';
+}
+
+// 同一条聚合内拖动排序 = 优先级；跨聚合拖动无意义，直接忽略。
+$('rtList').addEventListener('dragstart', ev => {
+  const li = ev.target.closest('.rt-it');
+  if (!li) return;
+  rtDrag = { ri: Number(li.dataset.ri), ti: Number(li.dataset.ti) };
+  ev.dataTransfer.effectAllowed = 'move';
+});
+$('rtList').addEventListener('dragover', ev => {
+  if (ev.target.closest('.rt-it')) ev.preventDefault();
+});
+$('rtList').addEventListener('drop', ev => {
+  const li = ev.target.closest('.rt-it');
+  if (!li || !rtDrag) return;
+  ev.preventDefault();
+  const ri = Number(li.dataset.ri), ti = Number(li.dataset.ti);
+  if (ri !== rtDrag.ri) { rtDrag = null; return; }
+  const arr = rtState.items[ri].targets;
+  if (rtDrag.ti < 0 || rtDrag.ti >= arr.length) { rtDrag = null; return; }
+  const moved = arr.splice(rtDrag.ti, 1)[0];
+  arr.splice(ti, 0, moved);
+  rtDrag = null;
+  renderRoutes();
+});
+$('rtList').addEventListener('dragend', () => { rtDrag = null; });
+
+$('rtList').addEventListener('input', ev => {
+  const el = ev.target;
+  // 搜索框：边输入边过滤（不重渲染整块，否则焦点与滚动位置会丢）
+  if (el.classList.contains('rt-pick-q')) { rtPickShow(Number(el.dataset.ri), el.value); return; }
+  if (el.classList.contains('rt-name')) rtState.items[Number(el.dataset.ri)].name = el.value;
+});
+$('rtList').addEventListener('focusin', ev => {
+  if (!ev.target.classList.contains('rt-pick-q')) return;
+  rtPickShow(Number(ev.target.dataset.ri), ev.target.value);
+});
+// 键盘：↑↓ 移动、Enter 添加、Esc 收起
+$('rtList').addEventListener('keydown', ev => {
+  const el = ev.target;
+  if (!el.classList.contains('rt-pick-q')) return;
+  const ri = Number(el.dataset.ri);
+  const box = document.getElementById('rtPickBox');
+  if (!box || box.style.display === 'none') return;
+  const rows = Array.prototype.slice.call(box.querySelectorAll('.rt-pick-item'));
+  if (!rows.length) return;
+  let idx = rows.findIndex(function (r) { return r.classList.contains('on'); });
+  if (ev.key === 'ArrowDown') {
+    ev.preventDefault();
+    idx = (idx + 1) % rows.length;
+  } else if (ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    idx = (idx - 1 + rows.length) % rows.length;
+  } else if (ev.key === 'Enter') {
+    ev.preventDefault();
+    if (idx >= 0) rtAddTarget(ri, rows[idx].dataset.id);
+    return;
+  } else if (ev.key === 'Escape') {
+    rtPickHide();
+    return;
+  } else {
+    return;
+  }
+  rows.forEach(function (r, i) {
+    r.classList.toggle('on', i === idx);
+    r.style.background = i === idx ? 'var(--surface-2)' : '';
+  });
+  rows[idx].scrollIntoView({ block: 'nearest' });
+});
+// 只有「点到输入框与弹层之外」才收起。用 mousedown 捕获阶段：
+// 它在 focus 变化之前触发，不会被候选行的 preventDefault 干扰。
+document.addEventListener('mousedown', ev => {
+  if (!rtPick || !ev.target.closest) return;
+  if (ev.target.closest('#rtPickBox') || ev.target.closest('.rt-pick')) return;
+  rtPickHide();
+}, true);
+// 页面滚动/窗口缩放只跟随重定位，不收起（弹层自身可滚动，收起会把自己滚没）
+addEventListener('scroll', rtPickOnScroll, true);
+addEventListener('resize', rtPickOnScroll);
+$('rtList').addEventListener('change', ev => {
+  const el = ev.target;
+  if (el.classList.contains('rt-on')) rtState.items[Number(el.dataset.ri)].enabled = el.checked;
+});
+
+$('rtList').addEventListener('click', ev => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn || !rtState) return;
+  const ri = Number(btn.dataset.ri), ti = Number(btn.dataset.ti);
+  const it = rtState.items[ri];
+  if (!it) return;
+  const act = btn.dataset.act;
+  if (act === 'delroute') {
+    rtState.items.splice(ri, 1);
+  } else if (act === 'del') {
+    it.targets.splice(ti, 1);
+  } else if (act === 'up' && ti > 0) {
+    const moved = it.targets.splice(ti, 1)[0];
+    it.targets.splice(ti - 1, 0, moved);
+  } else if (act === 'down' && ti < it.targets.length - 1) {
+    const moved = it.targets.splice(ti, 1)[0];
+    it.targets.splice(ti + 1, 0, moved);
+  } else {
+    return;
+  }
+  renderRoutes();
+});
+
+$('rtAdd').onclick = () => {
+  if (!rtState) return;
+  rtState.items.push({ name: '', enabled: true, targets: [], on: [] });
+  renderRoutes();
+};
+$('rtEnabled').onchange = ev => { if (rtState) rtState.enabled = ev.target.checked; };
+$('rtMaxAttempts').onchange = ev => { if (rtState) rtState.maxAttempts = Number(ev.target.value) || 0; };
+
+$('rtSave').onclick = async () => {
+  if (!rtState) return;
+  const btn = $('rtSave');
+  btn.disabled = true;
+  try {
+    // 取最新配置再整体回传：只改 routes 一个键，避免覆盖别人刚改的其它字段。
+    const d = await api('config');
+    const cfg = d.config || {};
+    const items = rtState.items.map(function (it) {
+      const out = {
+        name: String(it.name || '').trim(),
+        enabled: !!it.enabled,
+        targets: it.targets.map(function (t) { return { realm: t.realm, model: t.model }; }),
+      };
+      if (it.on && it.on.length) out.on = it.on;
+      return out;
+    });
+    cfg.routes = { enabled: !!rtState.enabled, items: items };
+    if (rtState.maxAttempts > 0) cfg.routes.max_attempts = rtState.maxAttempts;
+    const r = await api('config', { method: 'POST', body: JSON.stringify(cfg) });
+    const restart = Array.isArray(r.restart_required) ? r.restart_required : [];
+    $('rtNote').textContent = '已保存' + (restart.length ? '（需重启生效：' + restart.join('、') + '）' : '（已热生效）');
+    toast('路由配置已保存', 'ok');
+    await loadRoutes();
+  } catch (e) {
+    $('rtNote').textContent = '保存失败：' + e.message;
+    toast('保存失败', 'err');
+  } finally {
+    btn.disabled = false;
+  }
+};
+/* ── route: end ─────────────────────────────────────────────────── */
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';

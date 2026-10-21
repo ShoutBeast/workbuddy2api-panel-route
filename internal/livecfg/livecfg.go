@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/route"
 )
 
 // Snapshot 一次读取的不可变配置视图。
@@ -22,6 +24,9 @@ type Snapshot struct {
 	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
 	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
 	ModelAliases         map[string]string   // 客户端名 → 真实模型名（键已归一化小写；"cn:x"/"global:x" 前缀键只在该域生效，裸名键两域都生效）；nil = 不映射。issue #30
+	// Routes 模型路由聚合快照（内部/route 归一化产物）；nil = 未启用或未配置。
+	// 与 ModelAliases 相互独立：聚合在别名之后生效（聚合优先）。
+	Routes *route.Snapshot
 }
 
 // NormalizeModelAliases 把用户配置的 aliases 条目（"客户端名=真实模型名"）归一化为查找表。

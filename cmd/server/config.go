@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/route"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
@@ -197,6 +199,15 @@ type Config struct {
 		// 面板保存后经 livecfg 热生效，无需重启。
 		Aliases []string `json:"aliases"`
 	} `json:"models"`
+
+	// routes: begin —— 模型路由聚合（我方扩展，详见 internal/route 与
+	// docs/模型路由聚合-技术方案-v2.md）。对外暴露一个聚合模型名，内部按配置顺序
+	// 尝试多个 (realm, 模型)；只有限流类失败耗尽当前目标后才落到下一个目标。
+	// 面板保存后经 livecfg 热生效，无需重启。
+	Routes route.Settings `json:"routes"`
+	// RoutesSnapshot 归一化后的只读快照（不落盘、不对面板回显）。
+	RoutesSnapshot *route.Snapshot `json:"-"`
+	// routes: end
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -666,8 +677,33 @@ func splitCSV(raw string) []string {
 	return out
 }
 
+// routes: begin —— 模型路由聚合（我方扩展）
+//
+// normalizeRoutes 校验 c.Routes 并填充 c.RoutesSnapshot。错误聚合了全部条目问题
+// （errors.Join），面板保存路径据此返回 400 且不落盘。
+// 这里用 Hidden 做交叉校验：聚合目标不得是被黑名单隐藏的模型——聚合不能成为
+// 绕过 models.hidden 的通道。
+func (c *Config) normalizeRoutes() error {
+	snap, err := route.Normalize(c.Routes, route.Options{
+		Hidden: livecfg.NormalizeHiddenModels(c.Models.Hidden),
+	})
+	if err != nil {
+		return err
+	}
+	c.RoutesSnapshot = &snap
+	return nil
+}
+
+// routes: end
+
 func (c *Config) normalize() error {
 	var err error
+	// routes: begin —— 模型路由聚合校验（我方扩展）。先于其它校验执行：它是
+	// 面板保存路径上新增的用户输入面，越早失败越容易定位。
+	if rerr := c.normalizeRoutes(); rerr != nil {
+		return rerr
+	}
+	// routes: end
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}

@@ -244,10 +244,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			h.cfg.RequestLog.Record(trace.event(status))
 		}()
-		h.mux.ServeHTTP(obs, r)
+		// route: begin —— 模型路由聚合调度（我方扩展，见 route_dispatch.go）
+		h.serveWithRoutes(obs, r)
 		return
 	}
-	h.mux.ServeHTTP(w, r)
+	h.serveWithRoutes(w, r)
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -467,6 +468,9 @@ func (h *Handler) hiddenModel(realm, bare string) bool {
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
+	// route: begin —— 聚合名出现在模型列表（我方扩展，见 route_dispatch.go）
+	out = append(out, h.routeModelEntries()...)
+	// route: end
 	for _, mi := range h.fetchDynamicModels() {
 		if h.hiddenModel("cn", mi.ID) {
 			continue
@@ -732,6 +736,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// route: begin —— 聚合请求的响应 model 回显（我方扩展）
+	// 内层 handler 看到的是目标真实模型名（"realm:model"），对外仍需回显聚合名。
+	// 值由 serveWithRoutes 覆盖写入，客户端伪造的同名头不可信（非聚合路径会被删）。
+	if v := r.Header.Get(routeEchoHeader); v != "" {
+		modelEcho = v
+	}
+	// route: end
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)

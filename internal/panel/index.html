@@ -881,6 +881,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </table>
         </div>
       </div>
+
+      <!-- 模型路由聚合（route: begin —— 我方扩展） -->
+      <div class="box">
+        <header>
+          <h3>模型路由聚合</h3>
+          <span class="grow"></span>
+          <label class="note" style="display:flex;align-items:center;gap:6px">
+            <input type="checkbox" id="rtEnabled"> 启用
+          </label>
+          <label class="note" style="display:flex;align-items:center;gap:6px">
+            尝试上限 <input id="rtMaxAttempts" type="number" min="0" max="20" value="0" style="width:64px" title="0 = 按链长自动（min(2N,6)）">
+          </label>
+          <button class="xs ghost" id="rtAdd">+ 新增聚合</button>
+          <button class="xs" id="rtSave">保存</button>
+        </header>
+        <div class="pad">
+          <div class="note" id="rtNote" style="margin-bottom:8px">
+            对外暴露一个模型名，内部按顺序尝试目标；拖拽排序即优先级。只有限流类失败才会落到下一个目标，内容拦截/会话失效/参数错误一律不切换。
+          </div>
+          <div id="rtList"></div>
+        </div>
+      </div>
+      <!-- route: end -->
     </section>
 
     <!-- 积分构成 -->
