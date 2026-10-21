@@ -16,6 +16,9 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -86,9 +89,32 @@ func (h *Handler) serveWithRoutes(w http.ResponseWriter, r *http.Request) {
 
 	var last *lazyResponse
 	lastKind := upstream.ErrNone
+	// skipped/earliest：本地预检跳过的目标数与最早解封时刻（仅用于最终错误与 Retry-After）
+	skipped := 0
+	var earliest time.Time
+	skipKind := upstream.ErrNone
+
 	for _, tgt := range chain.Targets {
 		if chain.Budget <= 0 {
 			break
+		}
+		// 本地预检：该 (realm, 模型) 已被全池锁定 → 零上游调用、零等待直接推进。
+		// 为什么必须放在 handler 之前：上游合并后 handler 会对「14003 全池挡住」
+		// 先等一次（busyWaitCap=10s）再报 503；多目标链上会串成 N×10s 的干耗，
+		// 而这种情况本地就能判定，根本没有必要进 handler。
+		if h.cfg.Pool != nil && tgt.Model != "" {
+			if blk := h.cfg.Pool.ModelBlockedForRealm(tgt.Model, tgt.Realm); blk.Blocked {
+				skipped++
+				if !blk.Until.IsZero() && (earliest.IsZero() || blk.Until.Before(earliest)) {
+					earliest = blk.Until
+				}
+				if upstream.IsModelBusy(blk.Reason) || strings.Contains(blk.Reason, "14003") {
+					skipKind = upstream.ErrSoftRate // 限流/繁忙：最终按 429 语义答复
+				} else if skipKind == upstream.ErrNone {
+					skipKind = upstream.ErrServer // 无权限/无此模型等硬失败：最终 503
+				}
+				continue
+			}
 		}
 		chain.Budget-- // 只在实际出站前扣减；本地无候选的跳过不耗预算
 
@@ -133,6 +159,15 @@ func (h *Handler) serveWithRoutes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if last == nil {
+		// 一个目标都没真正出站：要么全部在本地被预检跳过，要么链为空。
+		if skipped > 0 {
+			if skipKind == upstream.ErrSoftRate {
+				writeRouteExhaustedAt(w, earliest)
+			} else {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "route_unavailable",
+					"all route targets are unavailable (model blocked on every account)")
+			}
+		}
 		return
 	}
 	if lastKind == upstream.ErrSoftRate {
@@ -145,8 +180,18 @@ func (h *Handler) serveWithRoutes(w http.ResponseWriter, r *http.Request) {
 
 // writeRouteExhausted 整条链都因限流失败时的响应：429 + Retry-After。
 // 错误体只说“聚合链已耗尽”，每个目标的具体失败原因留在日志/面板。
-func writeRouteExhausted(w http.ResponseWriter) {
-	w.Header().Set("Retry-After", "60")
+func writeRouteExhausted(w http.ResponseWriter) { writeRouteExhaustedAt(w, time.Time{}) }
+
+// writeRouteExhaustedAt 同 writeRouteExhausted，但 Retry-After 尽量取**最早解封时刻**
+// （上游给了权威恢复时间时，让客户端等对时间，而不是固定 60s）。
+func writeRouteExhaustedAt(w http.ResponseWriter, until time.Time) {
+	secs := 60
+	if !until.IsZero() {
+		if d := int(time.Until(until).Seconds() + 0.999); d > 0 && d < 3600 {
+			secs = d
+		}
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
 	writeOpenAIError(w, http.StatusTooManyRequests, "route_exhausted",
 		"all route targets are rate-limited, retry later")
 }
