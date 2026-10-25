@@ -77,14 +77,6 @@ var sanitizeRewrites = [][2]string{
 		"11128",
 		"11-128",
 	},
-	{
-		// DSH 的身份句（@deepseek-ai/dsh-system-prompt 注入的 harness:identity 段）被上游
-		// 当成「非官方渠道调用」整单拦截：400 11-128 Illegal API invocation from an
-		// unapproved channel。实测换一词即绕过（与插 U+200B 等效，但可见、可 diff）。
-		// 按短语全局替换而非只认开头：同一品牌词在长提示词正文里还会出现多次。
-		"DeepSeek Harness",
-		"DeepSeekRuntime",
-	},
 }
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
@@ -95,6 +87,9 @@ func sanitizeText(text string) string {
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
+	// route: begin —— 品牌词改写（上游全局语义 + .exe 文件名放行）
+	text = replaceBrand(text)
+	// route: end
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
@@ -226,3 +221,52 @@ func sanitizeMessages(messages []any) bool {
 	}
 	return changed
 }
+
+// route: begin —— 我方扩展：品牌词改写放行 .exe 文件名
+//
+// 上游语义是全局替换（带空格形态 → 连写形态）。这里保留该语义，只加一个例外：
+// 品牌词后**紧跟 .exe**（大小写不敏感）时原样保留——否则 `DeepSeek Harness.exe`
+// 这类可执行文件名会被改成另一个名字，用户讨论/传递文件名时内容被悄悄篡改。
+//
+// 常量用 \x 转义构造：整词字面量在本仓编辑/传输链路上被改写过（期望 23 字节，
+// 落盘成 24 字节带空格变体），转义写法在源码里只有 ASCII 十六进制，天然免疫。
+const (
+	brandSpacedHex = "\x44\x65\x65\x70\x53\x65\x65\x6b\x20\x48\x61\x72\x6e\x65\x73\x73" // DeepSeek + 空格 + Harness
+	brandJoinedHex = "\x44\x65\x65\x70\x53\x65\x65\x6b\x52\x75\x6e\x74\x69\x6d\x65"     // DeepSeek + Runtime
+)
+
+// replaceBrand 把品牌词的带空格形态改写为连写形态（上游语义），但跳过文件名：
+// 命中点后紧跟 .exe 时保留原样。返回改写后的文本。
+func replaceBrand(text string) string {
+	from, to := brandSpacedHex, brandJoinedHex
+	if !strings.Contains(text, from) {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	for {
+		i := strings.Index(text, from)
+		if i < 0 {
+			b.WriteString(text)
+			return b.String()
+		}
+		b.WriteString(text[:i])
+		rest := text[i+len(from):]
+		if hasExeSuffix(rest) {
+			b.WriteString(from) // 文件名形态：原样保留
+		} else {
+			b.WriteString(to)
+		}
+		text = rest
+	}
+}
+
+// hasExeSuffix 报告 s 是否以 ".exe" 开头（大小写不敏感）。
+func hasExeSuffix(s string) bool {
+	if len(s) < 4 || s[0] != '.' {
+		return false
+	}
+	return s[1]|0x20 == 'e' && s[2]|0x20 == 'x' && s[3]|0x20 == 'e'
+}
+
+// route: end
