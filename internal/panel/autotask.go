@@ -13,6 +13,8 @@
 //     （template_used / playbook_prompt_send / wbx_design_canvas_*），纯 API 可点亮（三账号实测）
 //   - expert_5 / Expert_team_use_3：真实专家列表 + 召唤链 + 真实 chat（服务端 requestId）
 //   - expert_actual_use（三账号实测）
+//   - expert_use_* 系列（中国电商运营专家 / 抖音策略师 / 商家宣传页与海报设计师 / 直播电商教练）：
+//     判据同 Expert_lighthouse，专家 id 取自任务 jump_url
 //   - Hp_Appearance：appearance/set + appearance_skin_apply 事件（两账号实测）
 //
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
@@ -32,9 +34,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // autoAction 一个可自动化的任务动作。
@@ -154,6 +157,26 @@ var autoActions = []autoAction{
 		TaskCode: "WorkBuddy_Valorant",
 		Desc:     "无畏契约拼豆专家召唤+使用链（判据同 Expert_lighthouse；活动截止 2026-11-15）",
 		run:      runValorantExpert,
+	},
+	{
+		TaskCode: "expert_use_maidehao",
+		Desc:     "中国电商运营专家召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_maidehao"),
+	},
+	{
+		TaskCode: "expert_use_douyinyin",
+		Desc:     "抖音策略师召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_douyinyin"),
+	},
+	{
+		TaskCode: "expert_use_shangjia_xuanchuan",
+		Desc:     "商家宣传页与海报设计师召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_shangjia_xuanchuan"),
+	},
+	{
+		TaskCode: "expert_use_bowangwang",
+		Desc:     "直播电商教练召唤+使用链（专家页搜索口径；活动截止 2026-11-20，+50c+5e）",
+		run:      runExpertExperienceFor("expert_use_bowangwang"),
 	},
 	{
 		TaskCode: "black_cat",
@@ -419,7 +442,7 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string) (string, error) {
 	need := target - t.Current
 	for i := int64(0); i < need; i++ {
 		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second))))
-		conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
+		conv := session.NewConversationID()
 		if err := p.cfg.Upstream.ReportMPEvent(a, upstream.MiniChatSendEvent(conv)); err != nil {
 			return "", fmt.Errorf("完成 %d/%d 次上报后中断: %w", i, need, err)
 		}
@@ -543,7 +566,7 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 func runSequentialAutomation(p *Panel, a *auth.Auth) (string, error) {
 	return p.runSequentialEventTask(a, "Sequential_Tasks_4",
 		func() error {
-			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent("wb2api 自动化"))
+			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent("自动化"))
 		}, nil)
 }
 
@@ -553,11 +576,11 @@ func runSequentialAutomation(p *Panel, a *auth.Auth) (string, error) {
 func runSequentialModelChat(p *Panel, a *auth.Auth) (string, error) {
 	return p.runSequentialEventTask(a, "Sequential_Tasks_5",
 		func() error {
-			conv := fmt.Sprintf("wb2api-mp-glm-%d", time.Now().UnixMilli())
+			conv := session.NewConversationID()
 			return p.cfg.Upstream.ReportMPEvent(a, upstream.MiniChatModelEvent(conv, "glm-5.2", "GLM-5.2"))
 		},
 		func() error {
-			return p.cfg.Upstream.ReportChatActivityModel(a, fmt.Sprintf("wb2api-mp-glm-%d", time.Now().UnixMilli()), "", "glm-5.2", "GLM-5.2")
+			return p.cfg.Upstream.ReportChatActivityModel(a, session.NewConversationID(), "", "glm-5.2", "GLM-5.2")
 		})
 }
 
@@ -565,11 +588,10 @@ func runSequentialModelChat(p *Panel, a *auth.Auth) (string, error) {
 // primary：PC 灵感事件组（DesktopPlaybookPromptSequence，playbook_prompt 三账号
 // 实测点亮）；fallback：mp 指纹灵感事件组（MiniPlaybookEvents，mpsrc 形状）。
 func runSequentialPlaybook(p *Panel, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
 	return p.runSequentialEventTask(a, "Sequential_Tasks_7",
 		func() error {
-			conv := fmt.Sprintf("wb2api-pb-%d", ms)
-			req := fmt.Sprintf("wb2api-pb-req-%d", ms)
+			conv := session.NewConversationID()
+			req := session.NewMessageID()
 			return p.cfg.Upstream.ReportDesktopEvent(a,
 				upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
 		},
@@ -909,7 +931,7 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 		return "进度已达标，无需上报", nil
 	}
 	for i := int64(0); i < need; i++ {
-		cid := fmt.Sprintf("wb2api-chat5-%d-%d", time.Now().UnixMilli(), i)
+		cid := session.NewConversationID()
 		if err := p.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			return "", fmt.Errorf("上报第 %d/%d 条失败: %w", i+1, need, err)
 		}
@@ -922,7 +944,7 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 
 // runFirstBuddy 领养：report（解锁前置）→ agreement → first。
 func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
-	if err := p.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := p.cfg.Upstream.ReportChatActivity(a, session.NewConversationID(), ""); err != nil {
 		return "", fmt.Errorf("前置上报: %w", err)
 	}
 	time.Sleep(reportGap) // 给上游事件处理留时间（脚本实测口径）
@@ -967,7 +989,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	rc.Close()
 	time.Sleep(reportGap)
 	// 3. 对齐模型的上报（触发进度）
-	if err := p.cfg.Upstream.ReportChatActivityModel(a, fmt.Sprintf("wb2api-glm52-%d", time.Now().UnixMilli()), "", modelID, modelName); err != nil {
+	if err := p.cfg.Upstream.ReportChatActivityModel(a, session.NewConversationID(), "", modelID, modelName); err != nil {
 		return "", fmt.Errorf("对话已完成，但进度上报失败: %w", err)
 	}
 	return "已完成 glm-5.2 对话并上报", nil
@@ -980,10 +1002,9 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 // （紫川/人杰2 两账号无桌面客户端登录状态下 3 秒内 0/1 → 1/1）。
 // Hp_Appearance 的纯 API set 不计分（需客户端在主题下活跃），区别对待。
 func runRichMeow(p *Panel, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-rm-%d", ms)
-	req := fmt.Sprintf("wb2api-rm-req-%d", ms)
-	msg := fmt.Sprintf("req-%d-user", ms)
+	conv := session.NewConversationID()
+	req := session.NewMessageID()
+	msg := session.NewMessageID()
 	events := upstream.DesktopChatSequence(conv, req, msg, "fast-model", "fast-model")
 	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", err
@@ -1009,7 +1030,7 @@ func runBuddyApp(p *Panel, a *auth.Auth) (string, error) {
 // 无需真实创建定时任务。
 func runAutomationCreate(p *Panel, a *auth.Auth) (string, error) {
 	if err := p.cfg.Upstream.ReportDesktopEvent(a,
-		upstream.DesktopAutomationCreateEvent("wb2api 自动化")); err != nil {
+		upstream.DesktopAutomationCreateEvent("自动化")); err != nil {
 		return "", err
 	}
 	return "已上报定时任务创建事件", nil
@@ -1178,6 +1199,95 @@ func runValorantExpert(p *Panel, a *auth.Auth) (string, error) {
 	return "已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）", nil
 }
 
+// expertExperienceTasks 「在专家页搜索并召唤「X」，完成一次对话」类活动的固定参数。
+//
+// 专家 id 全部取自任务自身的 jump_url（PC 的 deeplink `experts?expertId=ex_…`、小程序的
+// `expert-center/detail?id=ex_…`），与专家市场真实条目一一对应（2026-10-23 实测：
+// keyword 搜索命中的 expert_id 与 jump_url 完全一致）。DisplayNameZH 是专家的**昵称**
+// （卖得好 / 斗音音 / 播旺旺），ProfessionZH 才是任务标题里的职业名——判据事件里
+// name 取昵称、expertTitle 取职业名，两者都参与服务端校验，不能互换。
+var expertExperienceTasks = map[string]upstream.MarketExpert{
+	"expert_use_maidehao": {
+		ExpertID: "ex_GDl31WahyIH0", ExpertType: "agent",
+		DisplayNameZH: "卖得好", ProfessionZH: "中国电商运营专家", Version: "1.0.1",
+	},
+	"expert_use_douyinyin": {
+		ExpertID: "ex_FbY5nlWTqDod", ExpertType: "agent",
+		DisplayNameZH: "斗音音", ProfessionZH: "抖音策略师", Version: "1.0.2",
+	},
+	"expert_use_shangjia_xuanchuan": {
+		ExpertID: "ex_Weo3x2EZuSDm", ExpertType: "agent",
+		DisplayNameZH: "商家宣传设计师", ProfessionZH: "商家宣传页与海报设计师", Version: "1.6.0",
+	},
+	"expert_use_bowangwang": {
+		ExpertID: "ex_WZY136wV5aMt", ExpertType: "agent",
+		DisplayNameZH: "播旺旺", ProfessionZH: "直播电商教练", Version: "1.0.2",
+	},
+}
+
+// runExpertExperienceFor 把任务码绑进 autoAction.run 的函数签名（run 只收 Panel/Auth）。
+func runExpertExperienceFor(code string) func(*Panel, *auth.Auth) (string, error) {
+	return func(p *Panel, a *auth.Auth) (string, error) {
+		return p.runExpertExperience(a, code)
+	}
+}
+
+// runExpertExperience 完成「体验「X」专家」类任务：专家页搜索 → 召唤链 → 真实对话
+// （服务端 requestId）→ expert_actual_use(mode=LOCAL)。
+//
+// 判据与 Expert_lighthouse / WorkBuddy_Valorant 同源（同一句任务文案、同一份
+// jump_url 形态）；差异只在专家本身，故复用同一条事件链，仅按任务码换专家参数。
+// 市场搜索只用于校正 version/名称（服务端以市场条目为准），搜不到就退回表内静态值
+// ——召唤链本身不依赖搜索成功。
+func (p *Panel) runExpertExperience(a *auth.Auth, code string) (string, error) {
+	spec, ok := expertExperienceTasks[code]
+	if !ok {
+		return "", fmt.Errorf("未登记的专家体验任务: %s", code)
+	}
+	e := spec
+	if list, err := p.cfg.Upstream.MarketExpertSearch(a, spec.ProfessionZH); err == nil {
+		for _, m := range list {
+			// 关键词会命中多个同名专家（display_name_zh 与 profession_zh 都参与匹配），
+			// 必须按 jump_url 里的 expert_id 精确落位。
+			if m.ExpertID == spec.ExpertID {
+				e = m
+				break
+			}
+		}
+	}
+	if e.ExpertType == "" {
+		e.ExpertType = "agent"
+	}
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
+		return "", fmt.Errorf("召唤链: %w", err)
+	}
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	if err != nil {
+		return "", fmt.Errorf("真实对话: %w", err)
+	}
+	msgID := "msg-" + req
+	if len(req) > 8 {
+		msgID = "msg-" + req[len(req)-8:]
+	}
+	events := upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model")
+	for _, ev := range events {
+		if ev["eventCode"] == "agent_task_created" {
+			ev["has_expert"] = true
+			ev["expert_id"] = e.ExpertID
+			ev["expert_name"] = e.DisplayNameZH
+			ev["expert_industry_id"] = ""
+		}
+	}
+	events = append(events, upstream.DesktopExpertActualUseLocal(e, conv, req))
+	// 对齐真实样本细节：专家页直连召唤的 actual_use 的 type 为空、cost=0。
+	events[len(events)-1]["type"] = ""
+	events[len(events)-1]["cost"] = 0
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件: %w", err)
+	}
+	return fmt.Sprintf("已上报「%s」召唤+使用链（真实对话 requestId）", e.ProfessionZH), nil
+}
+
 // runAppearance 完成 Hp_Appearance（换主题）。
 // 2026-09-12 紫川/人杰2 实测（desktopverify12）：判据是 appearance_skin_apply
 // 事件 {action:"apply",source:"settings_close",id:<resourceKey>,...}（客户端在
@@ -1204,9 +1314,8 @@ func runAppearance(p *Panel, a *auth.Auth) (string, error) {
 func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
 	templates := [][2]string{{"1", "深度研究"}, {"2", "周报生成"}, {"3", "竞品分析"}, {"4", "活动策划"}, {"5", "代码评审"}}
 	for i, tp := range templates {
-		ms := time.Now().UnixMilli()
-		conv := fmt.Sprintf("wb2api-tpl-%d-%d", ms, i)
-		req := fmt.Sprintf("wb2api-tpl-req-%d-%d", ms, i)
+		conv := session.NewConversationID()
+		req := session.NewMessageID()
 		events := upstream.DesktopTemplateUseSequence(conv, req, tp[0], tp[1])
 		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 			return "", fmt.Errorf("第 %d 组模板事件上报失败: %w", i+1, err)
@@ -1219,9 +1328,8 @@ func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
 // runPlaybookPrompt 完成 playbook_prompt（灵感案例 Dialog 中发送 Prompt）。
 // 判据是 playbook_prompt_send（Dialog 发送）而非卡片曝光/点击——asar 逆向确认。
 func runPlaybookPrompt(p *Panel, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-pb-%d", ms)
-	req := fmt.Sprintf("wb2api-pb-req-%d", ms)
+	conv := session.NewConversationID()
+	req := session.NewMessageID()
 	events := upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")
 	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", err
@@ -1232,9 +1340,8 @@ func runPlaybookPrompt(p *Panel, a *auth.Auth) (string, error) {
 // runCreateCanvas 完成 create_canvas（设计创意模式创建画布，+300 分）。
 // 判据是 wbx_design_canvas_task_create/open（Ardot create_design 工具完成遥测）。
 func runCreateCanvas(p *Panel, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-canvas-%d", ms)
-	req := fmt.Sprintf("wb2api-canvas-req-%d", ms)
+	conv := session.NewConversationID()
+	req := session.NewMessageID()
 	events := upstream.DesktopDesignCanvasSequence(conv, req)
 	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", err

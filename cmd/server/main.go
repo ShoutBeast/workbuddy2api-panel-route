@@ -20,20 +20,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/misakano7545/workbuddy2api-panel/internal/alert"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
+	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
+	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
+	"github.com/misakano7545/workbuddy2api-panel/internal/server"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
 
 // appVersion 面板版本，透出到 /panel/api/overview。
@@ -169,6 +170,14 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
+	if cfg.Features.SanitizeBlacklistFingerprints {
+		if cfg.Features.SanitizeBrandScope == "identity" {
+			log.Printf("指纹脱敏已启用；品牌词规则仅作用于 system/developer（features.sanitize_brand_scope=identity）")
+		} else {
+			log.Printf("指纹脱敏已启用；品牌词规则作用于所有消息角色（features.sanitize_brand_scope=all）")
+		}
+	}
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -193,6 +202,14 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// 余额采样记录器：与 state 文件同目录（路径由 state 推出，不加配置项）。
+	// 采样动作挂在余额刷新之后（见 internal/scheduler），这里只管装配与落盘生命周期。
+	balPath := stateSibling(cfg.StateFile, "balance_history.json")
+	bal := balance.New(balPath)
+	bal.Start()
+	defer bal.Stop()
+	log.Printf("[balance] 余额趋势采样已启用: %s 每 %v 一点（%s）", balPath, balance.Interval(), bal.Describe())
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -202,6 +219,8 @@ func main() {
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
+		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -210,6 +229,8 @@ func main() {
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
+		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		JitterMinutes:          cfg.Schedule.JitterMinutes,
@@ -291,6 +312,8 @@ func main() {
 		// route: begin —— 模型路由聚合快照（我方扩展）
 		Routes: cfg.RoutesSnapshot,
 		// route: end
+		// 模型降级路由表（pool.model_fallback）：6004 限流时同账号改用等价模型。
+		ModelFallback: cfg.Pool.ModelFallback,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -335,6 +358,10 @@ func main() {
 		RequestLog: requestLog,
 		Upstream:   up,
 		Scheduler:  sch,
+		// 降级路由表：面板据此在限流提示里标注「已路由至 <等价模型>」。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
+		// 余额趋势采样记录器：nil 时该视图返回 501。
+		Balance: bal,
 		// 后台任务的自动触发开关与成长任务排程共用热配置（schedule.growth_enabled）。
 		AutoTasksEnabled: sch.GrowthEnabled,
 		AuthDir:          cfg.AuthDir,
@@ -391,7 +418,9 @@ func main() {
 		Usage:        rec,
 		RequestLog:   requestLog,
 		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		// 模型降级路由表：读 live 快照（支持面板热更，改完即生效、无需重启）。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
+		PromptText:    cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -676,6 +705,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		// route: end
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -687,6 +717,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
+	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
 	p.SetReserveCredits(*newCfg.Pool.ReserveCredits)  // 保留积分热生效（0 = 关闭，缺省 10）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority) // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)

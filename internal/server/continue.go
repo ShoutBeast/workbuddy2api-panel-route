@@ -31,9 +31,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // maxContinueSegments 单请求最多上游段数（1 段原生 + 最多 2 次续写）。
@@ -74,6 +74,8 @@ type continueReader struct {
 	id       string
 
 	blindRetried bool // 断流盲重试已用（每请求一次；见 canContinue）
+
+	starvedTried bool // 空截断救援已用（每请求一次；见 tryStarvedRetry）
 
 	lastClientAt time.Time // 上次客户端可见输出/keepalive 的时刻（静默节流）
 
@@ -270,6 +272,9 @@ func (r *continueReader) endSegment(sawDone bool) {
 	}
 	if r.cur != nil {
 		r.cur.Close()
+	}
+	if r.tryStarvedRetry() {
+		return
 	}
 	if r.canContinue(sawDone) {
 		// 必须是「断流盲重试」还是「length 截断续写」（r.finish 在续写成功后被重置）。

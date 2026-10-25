@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/route"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/route"
+	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
 )
 
 // Config 顶层配置。
@@ -77,8 +77,12 @@ type Config struct {
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
-		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
-		GrowthHours    []int `json:"growth_hours"`    // [11] 成长任务队列（任务中心待办）自动执行
+		// KeepaliveRefreshWindow 周期 token 保活的临期窗口（如 "168h"=7 天）：排程到点
+		// 的保活只刷新剩余有效期 <= 窗口（或已过期/无 expiry）的凭证；面板手动
+		// 「全部保活」始终全量，不受影响。空 = 默认 "168h"；非法或 <=0 的值 fail fast。
+		KeepaliveRefreshWindow string `json:"keepalive_refresh_window"`
+		BlackcatHours          []int  `json:"blackcat_hours"` // [23] 夜猫子窗口（23:00–08:00 计数）
+		GrowthHours            []int  `json:"growth_hours"`   // [11] 成长任务队列（任务中心待办）自动执行
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled/GrowthEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -142,8 +146,13 @@ type Config struct {
 		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
 		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
 		Enabled bool `json:"enabled"`
-		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
-		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 按账号 auth 文件的
+		// domain 选官方主机（internal/loginsite.BaseForDomain）：
+		//   *.codebuddy.ai → https://www.codebuddy.ai（官方 CLI 国际站，缺省）
+		//   *.workbuddy.ai → https://www.workbuddy.ai（旧桌面端）
+		// domain 缺失时回落 https://www.codebuddy.ai。
+		// 两个国际域实测同一后端，差别只在主机名与 WAF 口径——所以不要为了
+		// 「统一」把 base 写死成一个域，老账号的 token 只在签发域可用。
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
@@ -195,6 +204,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
+		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
+		SanitizeBrandScope string `json:"sanitize_brand_scope"`
 	} `json:"features"`
 
 	Models struct {
@@ -292,6 +304,15 @@ type Config struct {
 		// 0.2 = 便宜模型（x0.11 这类）在触底号上放行入账，x1.62 这类仍按收费拦。
 		// 0 = 严格模式（任何已知正倍率都拦）；负值钳 0。面板「积分保底」档位旁可改。
 		CreditFloorMaxRate float64 `json:"credit_floor_max_rate"`
+		// ModelFallback 模型降级路由表：key = 客户端请求的模型（裸名），
+		// value = 该模型被 6004 模型级限流时改用的等价模型。
+		// 例：{"deepseek-v4.1-flash": "deepseek-v4-flash"}。
+		//
+		// 语义：等价模型是同一底层能力、只是计价不同；便宜的那个被限流时改用
+		// 稍贵的继续服务（可用性优先），限流解除后自动回原模型（不写持久状态）。
+		// 只对 6004 生效；11102/11101/普通 429/5xx 都不降级。
+		// 缺省 nil = 不降级（对老配置零影响）。
+		ModelFallback map[string]string `json:"model_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -345,6 +366,8 @@ type Config struct {
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// KeepaliveRefreshWindowDur 解析后的周期保活临期窗口；空回落 168h，<=0 报错。
+	KeepaliveRefreshWindowDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -373,6 +396,8 @@ func Default() *Config {
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
+	// 周期保活临期窗口默认 7 天：排程保活只刷新一周内到期的凭证，其余账号不动。
+	c.Schedule.KeepaliveRefreshWindow = "168h"
 	c.Schedule.BlackcatHours = []int{23}
 	c.Schedule.GrowthHours = []int{11}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
@@ -395,6 +420,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBrandScope = "all"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -574,6 +600,9 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_SANITIZE_BRAND_SCOPE"); v != "" {
+		c.Features.SanitizeBrandScope = v
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -653,6 +682,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_CLIENT_NAME", "upstream.client_name", ""}, {"WB2A_DEVICE_TOKEN", "upstream.device_token", ""},
 		{"WB2A_DEVICE_TOKEN_FILE", "upstream.device_token_file", ""}, {"WB2A_PASSTHROUGH_IP", "upstream.passthrough_ip", "bool"},
 		{"WB2A_SANITIZE_FINGERPRINTS", "features.sanitize_blacklist_fingerprints", "bool"},
+		{"WB2A_SANITIZE_BRAND_SCOPE", "features.sanitize_brand_scope", ""},
 		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
 		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
 		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
@@ -880,6 +910,18 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.KeepaliveHours) == 0 {
 		c.Schedule.KeepaliveHours = []int{22}
 	}
+	// 周期保活临期窗口：空回落默认 168h（Default 已置，兜底显式 ""）；非法值
+	// fail fast（拼写错误静默吞掉等于窗口变 0 → 全量刷新，违背本字段意图）；
+	// <=0 无合理语义（0/负值想全量应直接删键），报错。
+	if c.Schedule.KeepaliveRefreshWindow == "" {
+		c.Schedule.KeepaliveRefreshWindow = "168h"
+	}
+	if c.KeepaliveRefreshWindowDur, err = time.ParseDuration(c.Schedule.KeepaliveRefreshWindow); err != nil {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %w", err)
+	}
+	if c.KeepaliveRefreshWindowDur <= 0 {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %q 必须为正时长（如 168h）", c.Schedule.KeepaliveRefreshWindow)
+	}
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
@@ -921,6 +963,14 @@ func (c *Config) normalize() error {
 		if strings.TrimSpace(c.Admin.AuditFile) == "" {
 			c.Admin.AuditFile = "./data/admin_audit.log"
 		}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Features.SanitizeBrandScope)) {
+	case "", "all":
+		c.Features.SanitizeBrandScope = "all"
+	case "identity":
+		c.Features.SanitizeBrandScope = "identity"
+	default:
+		return fmt.Errorf("features.sanitize_brand_scope: %q 非法（all = 所有消息角色；identity = 仅 system/developer）", c.Features.SanitizeBrandScope)
 	}
 	if err := c.normalizeAlerting(); err != nil {
 		return err

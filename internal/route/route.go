@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // Target 链上一环。

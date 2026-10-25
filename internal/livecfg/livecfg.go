@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/route"
+	"github.com/misakano7545/workbuddy2api-panel/internal/route"
 )
 
 // Snapshot 一次读取的不可变配置视图。
@@ -27,6 +27,10 @@ type Snapshot struct {
 	// Routes 模型路由聚合快照（内部/route 归一化产物）；nil = 未启用或未配置。
 	// 与 ModelAliases 相互独立：聚合在别名之后生效（聚合优先）。
 	Routes *route.Snapshot
+	// ModelFallback 模型降级路由表（pool.model_fallback）：6004 模型级限流时改用
+	// 的等价模型（裸名 → 裸名）。nil = 不降级。与 aliases 的区别：aliases 是
+	// 「客户端名→真实名」的静态映射，本表是「限流时的临时改道」，且不写持久状态。
+	ModelFallback map[string]string
 }
 
 // NormalizeModelAliases 把用户配置的 aliases 条目（"客户端名=真实模型名"）归一化为查找表。

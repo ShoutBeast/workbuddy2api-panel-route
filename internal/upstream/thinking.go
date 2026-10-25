@@ -48,6 +48,15 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
+// ThinkingSwitchSupported 该模型能否用 thinking.type 关掉思考。
+//
+// 目前只有 DeepSeek 系：thinking.go 只对这类模型注入 thinking 字段，也只有它验证过
+// 「disabled + 同额度 → 正文正常」。入参可带 realm 前缀（cn:/global:）。
+func ThinkingSwitchSupported(model string) bool {
+	_, bare := SplitRealmPrefix(model)
+	return isDeepSeekModel(bare)
+}
+
 // backfillReasoningContent DeepSeek 多轮一致性：保证每条 assistant 消息带
 // reasoning_content 字段且值为 string——即 requiresReasoningContentOnAssistantMessages
 // （官方客户端 matches 规则，issue #165 对齐官方 apply 门控）。
@@ -143,6 +152,23 @@ func backfillReasoningContent(obj map[string]any) {
 	}
 }
 
+// effortValueOff 客户端档位字段是否表达「关闭思考」。off/none 都不在 effortRank
+// 里，不截住就会被当未知值透传、或被 rank 0 的 off 就近降级成**最弱正档**——
+// 「关思考」反而变成「思考开着但最弱」（issue #66 同类：实测 off 仍返回 157 字思维链）。
+func effortValueOff(obj map[string]any) bool {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		v, ok := obj[k].(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "off", "none", "disabled":
+			return true
+		}
+	}
+	return false
+}
+
 // injectThinking 按 DeepSeek 思维链开关规则改写请求体。非 deepseek 零改动。
 //
 // 核心逻辑（对齐官方客户端）：
@@ -156,6 +182,19 @@ func backfillReasoningContent(obj map[string]any) {
 func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
+		return
+	}
+	// 客户端用档位字段表达关闭（off/none/disabled）：转成 thinking.type=disabled。
+	// 这一步必须在下面的注入之前——否则无 thinking 的请求会被补 enabled + 默认档，
+	// 降级管线再把 off 就近抬成最弱正档，「关思考」变成「思考开着但最弱」。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+		if th, ok := obj["thinking"].(map[string]any); ok {
+			th["type"] = "disabled"
+		} else {
+			obj["thinking"] = map[string]any{"type": "disabled"}
+		}
 		return
 	}
 	th, ok := obj["thinking"].(map[string]any)

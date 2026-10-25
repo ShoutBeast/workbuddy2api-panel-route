@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 func enabled(v bool) *bool { return &v }

@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // routeEchoHeader 内部头：把对外聚合名带进内层 handler，用于响应 model 回显。

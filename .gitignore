@@ -46,6 +46,12 @@ docs/
 
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/
+# 抓包取证脚本与原始报文（issue #51 等）；结论写进 issue，不进仓库
+/capture/
 *.zip
 /参考
 server.exe
+
+# 编译产物（16MB 误提交过一次，20261021）
+/server
+/app.toml

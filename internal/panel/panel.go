@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"net/http"
@@ -23,15 +24,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/balance"
+	"github.com/misakano7545/workbuddy2api-panel/internal/credithist"
+	"github.com/misakano7545/workbuddy2api-panel/internal/httpauth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
+	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
+	"github.com/misakano7545/workbuddy2api-panel/internal/scheduler"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
+	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -73,6 +75,12 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+	// Balance 余额趋势采样记录器（nil = 该视图返回 501）
+	Balance *balance.Recorder
+	// ModelFallback 模型降级路由表（读 live 快照，支持热更）。nil = 未配置。
+	// 面板据它在限流提示里标注「已路由至 X」—— 否则用户看到「v4.1 限流」
+	// 会以为服务断了，实际请求已被自动改道到等价模型继续服务。
+	ModelFallback func() map[string]string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -151,6 +159,10 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	// site 登录站点（cn/intl/workbuddy，对齐官方域表）。决定 poll 用哪套端点：
+	// 国际域 codebuddy.ai 与 workbuddy.ai 同后端不同主机，混用会把请求打到非签发域。
+	// 空 = 老会话/未指定，按 cn 处理（siteOrDefault 归一）。
+	site string
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。前端每 3s 轮询，而成功
 	// 分支的副作用可能耗时数秒：没有这个闸门，第二个并发 poll 会把整段流程再跑一遍。
 	processing bool
@@ -186,6 +198,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	// (账号 × 模型) 手动开关：运维显式禁用某账号的某模型（永久语义，仅手动解）。
+	// 与上游触发的临时冷却（6004/11102）正交，且手动优先。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.withAuth(p.modelToggle))
+	// 封禁账号探活：只读探测上游是否已解封，不 revive、不参与选号。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.withAuth(p.accountProbeBan))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -219,6 +236,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
@@ -301,7 +319,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":        disabled,
 		"paused":          paused,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// 模型降级路由表：前端据它标注「⤳ 已路由至 X」（限流的模型若配了等价模型）。
+		"model_fallback": p.modelFallbackSnapshot(),
+		"accounts":       p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久，移植上游
 		// PR #120）：与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -515,12 +535,13 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	// 「模型与档位」也必须看得到——否则用户不知道有哪些能调。字段与对话模型同口径，
 	// 另加 image_generation 标记（前端据此标「出图」）。视频不列：没有网关端点。
 	//
-	// 倍率口径（2026-10-18 复测，两域计费模型不同）：
-	//   - 牌价 `credits` 只部分模型有：CN hunyuan-image-alpha 报 x5.00，**但实扣是每张
-	//     固定 5.71**（牌价低 14%，不能拿牌价当实付）；
-	//   - global gpt-image-2.5-sunburst 目录里连 credits 键都没有，因为它是**按输出
-	//     图像 token 计费**（credit = tokens/7300），单张价格随 quality/size 变（1024²
-	//     low 0.55 / high 4.84）。
+	// 倍率口径（2026-10-22 复测，两个个人号直连上游）：
+	//   - 目录**不再给出图模型报 credits**：CN hunyuan-image-alpha 的条目只有
+	//     id/name/tags（2026-10-18 曾报 x5.00，现已无该键），所以「倍率」只能来自
+	//     出图回执里的 usage.credit——牌价这列现在对出图模型基本恒空；
+	//   - CN hunyuan-image-alpha 实扣每张固定 5.71，回执带 output_image_coefficient:1；
+	//   - global hy-image-3.5 实扣每张固定 0.27，回执恒 output_image_tokens:15000，
+	//     不带 coefficient；旧 global 模型 gpt-image-2.5-sunburst 已下架（14401）。
 	// 故这里三个字段并列输出，前端各按语义展示，绝不用均值覆盖牌价：
 	//   credits         上游目录牌价（可能没有）
 	//   measured_credit 账本里该模型的平均实扣（落盘口径，跨重启）
@@ -563,6 +584,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 					"quality":             last.Quality,
 					"output_image_tokens": last.LastTokens,
 					"at":                  last.LastAt,
+				}
+				// 上游回执里的「倍率」原值（CN 恒 1；global 不回该字段则省略）——
+				// 只透传不重算：它是上游口径，拿它乘单价得出的数会跟 credit 对不上。
+				if last.LastCoefficient > 0 {
+					e["charge_last"].(map[string]any)["output_image_coefficient"] = last.LastCoefficient
 				}
 			}
 			if _, hasCatalog := e["credits"]; hasCatalog && e["credits"] != "" {
@@ -737,8 +763,20 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	p.cfg.Pool.Disable(uid, "manual disable (panel)")
-	log.Printf("panel: disable uid=%s（人工禁用）", uid)
+	// reason 可选：面板人工禁用默认记「管理员操作」，但允许调用方指定真实原因
+	// （例：补录历史禁用、脚本按上游判定结果禁用）。不带则沿用默认文案。
+	reason := "面板手动禁用（管理员操作）"
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req) // 空 body/非法 JSON 不算错：保持默认
+	}
+	if v := strings.TrimSpace(req.Reason); v != "" {
+		reason = v
+	}
+	p.cfg.Pool.Disable(uid, reason)
+	log.Printf("panel: disable uid=%s（人工禁用）reason=%s", uid, reason)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1177,4 +1215,209 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// balanceHistory 返回余额采样序列，供「余额趋势」视图画折线。
+// days 查询参数控制窗口（默认 30，上限 30 = detailedKeep；更早的数据已折叠为日粒度，
+// 传更大值也只能拿到日粒度点）。
+func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Balance == nil {
+		writeErr(w, http.StatusNotImplemented, "balance recorder not available")
+		return
+	}
+	days := 30
+	if v := r.URL.Query().Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
+		}
+	}
+	if days > 30 {
+		days = 30
+	}
+	since := time.Now().AddDate(0, 0, -days)
+	// 昵称仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// 昵称与域仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// realm 必须在 Snapshot 前注入：cn 与 global 的积分不同源、不可互换，
+	// 跨域求和语义不成立，前端需按域分组渲染。
+	for _, st := range p.cfg.Pool.List() {
+		if st.Nickname != "" {
+			p.cfg.Balance.SetName(st.UID, st.Nickname)
+		}
+		if st.Realm != "" {
+			p.cfg.Balance.SetRealm(st.UID, st.Realm)
+		}
+	}
+	series, now := p.cfg.Balance.Snapshot(since)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"now":    now.Format(time.RFC3339),
+		"days":   days,
+		"series": series,
+	})
+}
+
+// modelToggle 手动开关某 (账号, 模型) 组合。
+//
+// 语义：这是**人工意图**（永久），与 modelCooldowns（上游触发、临时、过期自动删）
+// 正交。手动关掉的组合自动机制不能恢复 —— 见 internal/pool/toggle.go 的说明。
+//
+// model 接受带前缀形式（cn:gpt-4）也接受裸名；入库前统一剥前缀，与出站口径一致
+// （上游只认裸名，且带前缀存会在模型改名/换域时对不上）。
+func (p *Panel) modelToggle(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	var req struct {
+		Model string `json:"model"`
+		Off   bool   `json:"off"`
+		Note  string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		writeErr(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	// 剥 realm 前缀（与出站口径一致：上游只认裸名）
+	if i := strings.Index(model, ":"); i >= 0 {
+		model = model[i+1:]
+	}
+	if req.Off {
+		if !p.cfg.Pool.SetModelOff(uid, model, req.Note) {
+			writeErr(w, http.StatusBadRequest, "set model off failed")
+			return
+		}
+	} else {
+		p.cfg.Pool.SetModelOn(uid, model)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid, "model": model, "off": req.Off,
+		"list": p.cfg.Pool.ModelOffOf(uid),
+	})
+}
+
+// modelFallbackSnapshot 返回当前降级路由表（nil 安全）。
+// 走回调而非持有 map：live 快照会随面板保存配置替换，持有旧 map 会读到过期表。
+func (p *Panel) modelFallbackSnapshot() map[string]string {
+	if p.cfg.ModelFallback == nil {
+		return nil
+	}
+	return p.cfg.ModelFallback()
+}
+
+// accountProbeBan 探测被封禁账号在上游是否已解封（**只读**，不改池状态）。
+//
+// 为什么需要（用户需求）：账号被 11140「账号存在异常行为」判死后，唯一的确认方式
+// 是反复 revive —— 但每次 revive 都会让账号重新参与选号、立刻再撞 11140，
+// 反复触发可能加重上游风控判定。需要一个「不惊动它」的问法。
+//
+// 用什么探：UserResource（余额查询）是最轻的只读端点，且 11140 会在这里原样返回
+// （上游 auth/auth_forbidden 在 billing 侧同样生效）。不用 chat —— 那会占在途、
+// 记连败、可能被计入风控。
+//
+// 判据：
+//   - 200            → 已解封（可以 revive 了）
+//   - 11140/封禁类   → 仍被封（继续等）
+//   - 401/session    → 不是封禁问题，是登录失效（该重登）
+//   - 其它           → 无结论（网络/限流等，稍后再试）
+//
+// 不写任何池状态：探测是观测行为，不该改变账号的可用性判断 —— 否则运维点一下
+// 探活就把号放回池子，等于变相 revive。
+func (p *Panel) accountProbeBan(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "account credentials not found")
+		return
+	}
+	resp := map[string]any{
+		"ok":           true,
+		"uid":          uid,
+		"nickname":     st.Nickname,
+		"was_disabled": st.Disabled,
+		"was_reason":   st.DisabledReason,
+		"probed_at":    time.Now().Format(time.RFC3339),
+	}
+	if p.cfg.Upstream == nil {
+		resp["verdict"] = "unknown"
+		resp["detail"] = "upstream client not configured"
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	_, _, err := p.cfg.Upstream.UserResource(a)
+	// 302/401 的求证与 chat 路径同一套逻辑（见 server/handler.go 的网关 401 分支）：
+	// 网关 401 的响应体是 APISIX 的 HTML 页，**封禁（11140）与登录失效看起来完全一样**，
+	// 单看 401 分不出来。refresh 才是权威判词：refresh 成功 = 会话仍活（那 401 就是
+	// 风控拦截，含 11140 封禁）；refresh 被明确拒绝 = 登录态真失效。
+	// 网关 401 的求证与 chat 路径同一套判据（upstream.VerifySessionByRefresh）：
+	// 封禁（11140）与登录失效的响应体都是 APISIX HTML 页，单看 401 分不出来。
+	if err != nil && isSessionDeadErr(err) {
+		switch p.cfg.Upstream.VerifySessionByRefresh(a) {
+		case upstream.VerifyAlive:
+			resp["verdict"] = "blocked"
+			resp["detail"] = err.Error()
+			resp["advice"] = "会话仍有效，但请求被上游风控拦截（可能仍是 11140 封禁）—— 继续观察，勿反复 revive"
+			log.Printf("panel: probe_ban uid=%s → 被拦截但会话有效（refresh ok）", uid)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		case upstream.VerifyInconclusive:
+			resp["verdict"] = "inconclusive"
+			resp["detail"] = err.Error()
+			resp["advice"] = "refresh 未给出明确判词（网络/限流等），稍后再试"
+			log.Printf("panel: probe_ban uid=%s → 无明确结论", uid)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		// VerifyDead：落到下面的 session_dead 分支。
+	}
+	switch {
+	case err == nil:
+		resp["verdict"] = "lifted"
+		resp["advice"] = "上游已解封，可以点「解冻」恢复使用"
+		log.Printf("panel: probe_ban uid=%s → 已解封", uid)
+	case isAccountFaultErr(err):
+		resp["verdict"] = "still_banned"
+		resp["detail"] = err.Error()
+		resp["advice"] = "仍被封禁，继续等待；勿反复 revive（可能加重风控）"
+		log.Printf("panel: probe_ban uid=%s → 仍被封", uid)
+	case isSessionDeadErr(err):
+		resp["verdict"] = "session_dead"
+		resp["detail"] = err.Error()
+		resp["advice"] = "不是封禁问题，是登录态失效 —— 需重新登录"
+		log.Printf("panel: probe_ban uid=%s → 登录失效（非封禁）", uid)
+	default:
+		resp["verdict"] = "inconclusive"
+		resp["detail"] = err.Error()
+		resp["advice"] = "无明确结论（网络/限流等），稍后再试"
+		log.Printf("panel: probe_ban uid=%s → 无结论: %v", uid, err)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// isAccountFaultErr 判断错误是否为账号级封禁/风控（11140 request illegal 等）。
+func isAccountFaultErr(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.Kind == upstream.ErrAccountFault
+}
+
+// isSessionDeadErr 判断错误是否为登录态失效。
+func isSessionDeadErr(err error) bool {
+	var ue *upstream.Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.Kind == upstream.ErrSessionDead
 }

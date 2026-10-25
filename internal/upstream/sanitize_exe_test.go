@@ -17,7 +17,7 @@ func TestBrandReplaceExeAllowed(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := sanitizeText(c.in); got != c.want {
+			if got := sanitizeTextWith(c.in, true); got != c.want {
 				t.Fatalf("got %q want %q", got, c.want)
 			}
 		})
@@ -27,7 +27,7 @@ func TestBrandReplaceExeAllowed(t *testing.T) {
 // 预检仍要命中品牌词（上游行为）：只有品牌词、没有其它指纹时也必须进入净化流程。
 // 同时这条钉住「特征表里的品牌词常量」与替换表用的是同一个字节形态。
 func TestBrandPrecheckStillHits(t *testing.T) {
-	if !hasFingerprint("prefix " + brandSpacedHex + " suffix") {
+	if !hasIdentityFingerprint("prefix " + brandSpacedHex + " suffix") {
 		t.Error("brand word should hit the fast path")
 	}
 }
