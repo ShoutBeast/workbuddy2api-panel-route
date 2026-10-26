@@ -1,0 +1,8 @@
+# 面板前端资源固定 LF。
+#
+# 原因：internal/panel 下的 Node 测试用 `src.indexOf('\n}\n')` 定位函数块
+# （如 events_view_test.go / remarks_store_test.go）。Windows 上 core.autocrlf=true
+# 会把工作区写成 CRLF，`\n}\n` 永远匹配不到，上游用例在本地会假红。
+# 只约束面板前端，不影响其它文件的检出行为。
+internal/panel/*.js   text eol=lf
+internal/panel/*.html text eol=lf

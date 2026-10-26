@@ -82,7 +82,7 @@ func newRouteHandlerWithPool(t *testing.T, up *upstream.Client, p *pool.Pool, it
 	})
 }
 
-func postChat(h *Handler, body string, hdr map[string]string) *httptest.ResponseRecorder {
+func postChatReq(h *Handler, body string, hdr map[string]string) *httptest.ResponseRecorder {
 	req, _ := http.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(body)))
 	for k, v := range hdr {
 		req.Header.Set(k, v)
@@ -97,7 +97,7 @@ func TestRouteDispatchPassthrough(t *testing.T) {
 	up, calls := newRouteUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	h := newRouteHandler(t, up, nil) // 空配置 → 无聚合
 
-	rec := postChat(h, `{"model":"glm-5.2","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"glm-5.2","stream":true,"messages":[]}`, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -121,7 +121,7 @@ func TestRouteDispatchAdvancesOnRateLimit(t *testing.T) {
 		Targets: []route.ConfigTarget{{Realm: "cn", Model: "m1"}, {Realm: "cn", Model: "m2"}},
 	}})
 
-	rec := postChat(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -151,7 +151,7 @@ func TestRouteDispatchStopsOnRequestError(t *testing.T) {
 		Targets: []route.ConfigTarget{{Realm: "cn", Model: "m1"}, {Realm: "cn", Model: "m2"}},
 	}})
 
-	rec := postChat(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
 	if rec.Code != 400 {
 		t.Fatalf("status=%d want 400（透传目标错误）body=%s", rec.Code, rec.Body.String())
 	}
@@ -172,9 +172,15 @@ func TestRouteDispatchBudgetAndExhaustion(t *testing.T) {
 		},
 	}})
 
-	rec := postChat(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
-	if rec.Code != 429 {
-		t.Fatalf("status=%d want 429 body=%s", rec.Code, rec.Body.String())
+	rec := postChatReq(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
+	// 上游统一了「轮转耗尽」的出口语义：503 model_busy（带 gateway_hint 与最早解封时间），
+	// 不再是网关自造的 429。聚合层不覆盖它——这个响应已经带上了客户端需要的重试信息，
+	// 而「整条链都被限流」与「单个目标被限流」对客户端是同一件事：稍后再试。
+	if rec.Code != 503 {
+		t.Fatalf("status=%d want 503 body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model_busy") {
+		t.Fatalf("body 应带 model_busy 语义: %s", rec.Body.String())
 	}
 	got := calls()
 	if len(got) > route.DefaultBudget(3) {
@@ -199,7 +205,7 @@ func TestRouteDispatchAdvancesAfterCommentOnlyStream(t *testing.T) {
 		Targets: []route.ConfigTarget{{Realm: "cn", Model: "m1"}, {Realm: "cn", Model: "m2"}},
 	}})
 
-	rec := postChat(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"Deepseek-Aggr","stream":true,"messages":[]}`, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -219,7 +225,7 @@ func TestRouteDispatchIgnoresSpoofedEchoHeader(t *testing.T) {
 	up, _ := newRouteUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	h := newRouteHandler(t, up, nil)
 
-	rec := postChat(h, `{"model":"glm-5.2","stream":true,"messages":[]}`,
+	rec := postChatReq(h, `{"model":"glm-5.2","stream":true,"messages":[]}`,
 		map[string]string{routeEchoHeader: "Spoofed-Name"})
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -242,7 +248,7 @@ func TestRouteDispatchSkipsLocallyBlockedTarget(t *testing.T) {
 		Targets: []route.ConfigTarget{{Realm: "cn", Model: "m1"}, {Realm: "cn", Model: "m2"}},
 	}})
 
-	rec := postChat(h, `{"model":"Aggr","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"Aggr","stream":true,"messages":[]}`, nil)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -270,7 +276,7 @@ func TestRouteDispatchAllBlockedReturns429(t *testing.T) {
 		Targets: []route.ConfigTarget{{Realm: "cn", Model: "m1"}, {Realm: "cn", Model: "m2"}},
 	}})
 
-	rec := postChat(h, `{"model":"Aggr","stream":true,"messages":[]}`, nil)
+	rec := postChatReq(h, `{"model":"Aggr","stream":true,"messages":[]}`, nil)
 	if rec.Code != 429 {
 		t.Fatalf("status=%d want 429 body=%s", rec.Code, rec.Body.String())
 	}

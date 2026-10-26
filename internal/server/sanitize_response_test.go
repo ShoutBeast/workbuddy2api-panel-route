@@ -83,7 +83,7 @@ func TestBrandRewriteOutboundOnly(t *testing.T) {
 			p := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at1", ExpiresAt: 9999999999})
 			h := NewHandler(Config{Pool: p, Upstream: up, Live: livecfg.New(livecfg.Snapshot{})})
 
-			rec := postChat(h, tc.reqBody, nil)
+			rec := postChatReq(h, tc.reqBody, nil)
 			if rec.Code != 200 {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
